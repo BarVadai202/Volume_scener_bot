@@ -21,6 +21,7 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
 
+# הטוקן הקבוע שלך
 TOKEN = "8762564504:AAFY4xJVdXOxD08U6rZ9nQuqE2S0Rl3SQAQ"
 USER_CHAT_ID = None
 ISRAEL_TZ = pytz.timezone('Asia/Jerusalem')
@@ -62,177 +63,172 @@ def format_vol(v: float):
         return f"{v/1e3:.0f}K"
     return str(int(v))
 
-def analyze_volume_trends(ticker_symbol: str):
+def detect_sustained_volume_period(ticker_symbol: str):
     """
-    מנתח גם ווליום יומי וגם ווליום חודשי מצטבר (30 יום אחרונים מול 30 יום שקדמו להם)
+    מנתח האם הנכס נמצא ב*תקופה* של ווליום חריג ועולה, ולא רק ביום בודד.
+    בודק:
+    1. יחס שבועי (5 ימי מסחר אחרונים) מול ממוצע חודשי/רב-חודשי (30 יום).
+    2. שינוי מצטבר מחודש לחודש (MoM Volume).
+    3. יחס יומי נוכחי.
     """
     try:
         t = yf.Ticker(ticker_symbol)
         hist = t.history(period="3mo")
-        if hist.empty or len(hist) < 40:
+        if hist.empty or len(hist) < 35:
             return None
 
-        # 1. חישוב ווליום יומי
-        curr_vol = float(hist['Volume'].iloc[-1])
+        # נתונים נוכחיים
         curr_close = float(hist['Close'].iloc[-1])
         prev_close = float(hist['Close'].iloc[-2])
-        day_change_pct = ((curr_close - prev_close) / prev_close) * 100
+        day_chg = ((curr_close - prev_close) / prev_close) * 100
+        curr_vol = float(hist['Volume'].iloc[-1])
 
-        past_20_vol = hist['Volume'].iloc[-21:-1]
-        avg_20_vol = float(past_20_vol.mean()) if not past_20_vol.empty else 1.0
-        daily_rvol = curr_vol / avg_20_vol if avg_20_vol > 0 else 1.0
+        # 1. ניתוח תקופתי: 5 ימים אחרונים מול 30 ימי מסחר קודמים
+        last_5_days_vol = hist['Volume'].iloc[-5:]
+        avg_5d = float(last_5_days_vol.mean())
 
-        # 2. חישוב ווליום חודשי מצטבר (Month over Month)
+        baseline_30d = hist['Volume'].iloc[-35:-5]
+        avg_baseline = float(baseline_30d.mean()) if not baseline_30d.empty else 1.0
+
+        # יחס תקופתי (פי כמה השבוע האחרון גבוה מהחודש שקדם לו)
+        period_ratio = avg_5d / avg_baseline if avg_baseline > 0 else 1.0
+        period_surge_pct = int((period_ratio - 1.0) * 100)
+
+        # 2. ניתוח חודש מול חודש קודם (MoM)
         last_month = hist.iloc[-21:]
         prev_month = hist.iloc[-42:-21]
+        vol_last_m = float(last_month['Volume'].sum())
+        vol_prev_m = float(prev_month['Volume'].sum())
+        mom_change = ((vol_last_m - vol_prev_m) / vol_prev_m) * 100 if vol_prev_m > 0 else 0.0
 
-        vol_last_month = float(last_month['Volume'].sum())
-        vol_prev_month = float(prev_month['Volume'].sum())
+        # 3. יחס יומי בודד
+        avg_20d = float(hist['Volume'].iloc[-21:-1].mean())
+        daily_rvol = curr_vol / avg_20d if avg_20d > 0 else 1.0
 
-        mom_vol_change_pct = ((vol_last_month - vol_prev_month) / vol_prev_month) * 100 if vol_prev_month > 0 else 0.0
-
-        # מדד התמדה: כמה ימים בחודש האחרון הווליום היה מעל הממוצע של 20 יום
-        days_above_avg = int((last_month['Volume'] > avg_20_vol).sum())
-        total_days = len(last_month)
+        # ניסוח הסבר מילולי חכם על התקופה
+        if period_surge_pct >= 50 or mom_change >= 50:
+            status_desc = "🚨 <b>גל ווליום מוסדי כבד:</b> כל התקופה האחרונה חווה זרימת כספים אגרסיבית מעל 50% מהרגיל."
+            is_hot_period = True
+        elif period_surge_pct >= 30 or mom_change >= 30:
+            status_desc = "🌊 <b>תקופת איסוף עקבית:</b> הממוצע של ימי המסחר האחרונים גבוה ב-30%+ מחודש הבסיס."
+            is_hot_period = True
+        elif period_surge_pct >= 15 or mom_change >= 15:
+            status_desc = "📈 <b>מגמת התעוררות תקופתית:</b> עלייה מצטברת של 15%+ ברמת הווליום הממוצעת."
+            is_hot_period = True
+        elif daily_rvol >= 1.30 and mom_change < 0:
+            status_desc = "⚠️ <b>נר בודד בלבד (אין גל תקופתי):</b> יש קפיצה יומית נקודתית, אך ברמה החודשית הווליום בירידה."
+            is_hot_period = False
+        else:
+            status_desc = "💤 <b>תקופה רגילה/נמוכה:</b> אין חריגה תקופתית משמעותית."
+            is_hot_period = False
 
         return {
             "price": round(curr_close, 2),
-            "day_change_pct": round(day_change_pct, 2),
-            "daily_rvol": round(daily_rvol, 2),
+            "day_chg": round(day_chg, 2),
             "curr_vol": curr_vol,
-            "avg_20_vol": avg_20_vol,
-            "mom_vol_change_pct": round(mom_vol_change_pct, 1),
-            "vol_last_month": vol_last_month,
-            "vol_prev_month": vol_prev_month,
-            "days_above_avg": days_above_avg,
-            "total_days": total_days
+            "period_ratio": round(period_ratio, 2),
+            "period_surge_pct": period_surge_pct,
+            "mom_change": round(mom_change, 1),
+            "daily_rvol": round(daily_rvol, 2),
+            "status_desc": status_desc,
+            "is_hot_period": is_hot_period,
+            "avg_5d": avg_5d,
+            "avg_baseline": avg_baseline
         }
     except Exception as e:
-        print(f"Error analyzing trend for {ticker_symbol}: {e}")
+        print(f"Error checking period for {ticker_symbol}: {e}")
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global USER_CHAT_ID
     USER_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
-        "📡 <b>סורק ווליום חכם (יומי + מגמות חודשיות) מחובר!</b>\n\n"
-        "הבוט מזהה לא רק קפיצות יומיות, אלא <b>תקופות של ווליום חריג (30%+ מחודש לחודש)</b> המעידות על כניסת כסף מוסדי מסיבי.\n\n"
+        "📡 <b>סורק תקופות ווליום ומגמות שוק מחובר!</b>\n\n"
+        "הבוט מתמקד ב<b>תקופות של ווליום עולה</b> (השוואת שבועות וחודשים) ולא בנר בודד ומטעה.\n\n"
         "פקודות:\n"
-        "/scan - הרצת סריקת שוק מקיפה כעת\n"
-        "/monthly - הצגת סקטורים ומניות שנמצאים ברצף ווליום חודשי עולה",
+        "/scan - סריקת תקופות ווליום בכל הסקטורים והמניות עכשיו\n"
+        "/status - בדיקת מצב מערכת",
         parse_mode="HTML"
     )
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global USER_CHAT_ID
     USER_CHAT_ID = update.message.chat_id
-    await update.message.reply_text("🔍 <b>מתחיל סריקה של שוק המניות והסקטורים...</b>", parse_mode="HTML")
+    await update.message.reply_text("🔍 <b>בודק תקופות של ווליום עולה בסקטורים ובמניות...</b>", parse_mode="HTML")
     await run_market_scan(context)
     await update.message.reply_text("🏁 <b>הסריקה הושלמה.</b>", parse_mode="HTML")
-
-async def monthly_trend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global USER_CHAT_ID
-    USER_CHAT_ID = update.message.chat_id
-    await update.message.reply_text("⏳ <b>מנתח סקטורים שנמצאים בגל ווליום חודשי עולה (+30% ומעלה)...</b>", parse_mode="HTML")
-
-    found_any = False
-    for sec_etf, sec_name in SECTORS_MAP.items():
-        data = analyze_volume_trends(sec_etf)
-        if not data:
-            continue
-
-        if data["mom_vol_change_pct"] >= 30.0:
-            found_any = True
-            msg = (
-                f"📈 <b><u>גל ווליום חודשי חריג בסקטור {sec_name} ({sec_etf})</u></b>\n\n"
-                f"• <b>עלייה חודשית במחזור:</b> <b>+{data['mom_vol_change_pct']}%</b> בהשוואה לחודש הקודם!\n"
-                f"• <b>מחזור 30 יום:</b> {format_vol(data['vol_last_month'])} (חודש קודם: {format_vol(data['vol_prev_month'])})\n"
-                f"• <b>ימי פעילות מוסדית:</b> ב-{data['days_above_avg']} מתוך {data['total_days']} ימי מסחר הווליום היה מעל הממוצע.\n"
-                f"• <b>הסבר תנועה:</b> כסף מוסדי מזרים ביקושים עקביים לסקטור זה לאורך זמן.\n"
-                f"• שער נוכחי: ${data['price']} ({data['day_change_pct']:+.2f}% היום)"
-            )
-            await update.message.reply_text(msg, parse_mode="HTML")
-
-    if not found_any:
-        await update.message.reply_text("ℹ️ לא נמצאו כרגע סקטורים עם עליית ווליום חודשית של 30%+.", parse_mode="HTML")
 
 async def run_market_scan(context: ContextTypes.DEFAULT_TYPE):
     if not USER_CHAT_ID:
         return
 
-    hot_sectors = []
+    hot_sectors_found = 0
+
     for sec_etf, sec_name in SECTORS_MAP.items():
-        data = analyze_volume_trends(sec_etf)
-        if not data:
+        sec_data = detect_sustained_volume_period(sec_etf)
+        if not sec_data:
             continue
 
-        # בדיקה האם הסקטור חווה קפיצה יומית של 15%+ או עלייה חודשית של 30%+
-        is_daily_hot = data["daily_rvol"] >= 1.15
-        is_monthly_surge = data["mom_vol_change_pct"] >= 30.0
-
-        if is_daily_hot or is_monthly_surge:
-            hot_sectors.append((sec_etf, sec_name, data))
-
-            trend_reason = ""
-            if is_monthly_surge and is_daily_hot:
-                trend_reason = f"🚨 <b>שילוב נדיר:</b> גם קפיצה יומית ({data['daily_rvol']:.2f}x) וגם גל חודשי עולה (+{data['mom_vol_change_pct']}%)!"
-            elif is_monthly_surge:
-                trend_reason = f"🌊 <b>גל כניסת כספים חודשי:</b> הווליום בחודש האחרון עלה ב-<b>{data['mom_vol_change_pct']}%</b> (איסוף סחורה ממושך)."
-            else:
-                trend_reason = f"⚡ <b>התעוררות יומית:</b> מחזור גבוה ב-<b>{int((data['daily_rvol']-1)*100)}%+</b> מהממוצע."
+        # מסננים: מתריעים רק אם יש תקופה של ווליום עולה (מעל 15%+ בתקופה)
+        if sec_data["is_hot_period"]:
+            hot_sectors_found += 1
 
             sec_msg = (
-                f"🏢 <b>סקטור בפוקוס ווליום: {sec_name} ({sec_etf})</b>\n\n"
-                f"{trend_reason}\n"
-                f"• יחס יומי (RVol): <b>{data['daily_rvol']:.2f}x</b>\n"
-                f"• עקביות: {data['days_above_avg']}/{data['total_days']} ימים מעל הממוצע החודש\n"
-                f"• שער: ${data['price']} ({data['day_change_pct']:+.2f}%)\n\n"
-                f"🔎 <i>סורק מניות מובילות בתוך הסקטור...</i>"
+                f"🏢 <b><u>תקופת ווליום עולה בסקטור {sec_name} ({sec_etf})</u></b>\n\n"
+                f"{sec_data['status_desc']}\n\n"
+                f"📊 <b>נתוני התקופה:</b>\n"
+                f"• יחס שבועי מול חודש קודם: <b>{sec_data['period_ratio']:.2f}x</b> ({sec_data['period_surge_pct']:+d}%)\n"
+                f"• שינוי ווליום חודש מול חודש (MoM): <b>{sec_data['mom_change']:+.1f}%</b>\n"
+                f"• יחס בנר היומי הנוכחי: {sec_data['daily_rvol']:.2f}x\n"
+                f"• שער: ${sec_data['price']} ({sec_data['day_chg']:+.2f}%)\n\n"
+                f"🔎 <i>סורק מניות בתוך {sec_name} שנמצאות גם הן בגל ווליום תקופתי...</i>"
             )
             await context.bot.send_message(chat_id=USER_CHAT_ID, text=sec_msg, parse_mode="HTML")
 
             # סריקת מניות הסקטור
             stocks = SECTOR_STOCKS.get(sec_etf, [])
-            stocks_data = []
+            hot_stocks_list = []
+            regular_stocks_list = []
+
             for sym in stocks:
-                s_res = analyze_volume_trends(sym)
-                if s_res:
-                    stocks_data.append((sym, s_res))
+                s_res = detect_sustained_volume_period(sym)
+                if not s_res:
+                    continue
+                # אם המניה בעצמה בתקופת ווליום עולה
+                if s_res["is_hot_period"]:
+                    hot_stocks_list.append((sym, s_res))
+                else:
+                    regular_stocks_list.append((sym, s_res))
 
-            # סינון מניות עם ווליום חריג יומי או חודשי
-            active_stocks = [
-                item for item in stocks_data 
-                if item[1]["daily_rvol"] >= 1.15 or item[1]["mom_vol_change_pct"] >= 30.0
-            ]
-            active_stocks.sort(key=lambda x: x[1]["daily_rvol"], reverse=True)
+            if hot_stocks_list:
+                # מיון מהתקופה החמה ביותר
+                hot_stocks_list.sort(key=lambda x: x[1]["period_surge_pct"], reverse=True)
+                stk_msg = f"🔥 <b><u>מניות שנמצאות בתקופת ווליום עולה ב-{sec_name}:</u></b>\n\n"
 
-            if active_stocks:
-                stk_msg = f"🎯 <b><u>מניות עם פעילות ווליום חריגה ב-{sec_name}:</u></b>\n\n"
-                for sym, s in active_stocks:
-                    badges = []
-                    if s["daily_rvol"] >= 1.50:
-                        badges.append("🚨 יומי כבד (+50%)")
-                    elif s["daily_rvol"] >= 1.30:
-                        badges.append("🔔 יומי עולה (+30%)")
-
-                    if s["mom_vol_change_pct"] >= 30.0:
-                        badges.append(f"🌊 גל חודשי (+{s['mom_vol_change_pct']}%)")
-
-                    badge_txt = " | ".join(badges) if badges else "👀 מעקב ראשוני"
-
+                for sym, s in hot_stocks_list:
                     stk_msg += (
-                        f"• <b>{sym}</b>: {badge_txt}\n"
-                        f"  ↳ יומי: <b>{s['daily_rvol']:.2f}x</b> ({format_vol(s['curr_vol'])})\n"
-                        f"  ↳ חודשי MoM: <b>{s['mom_vol_change_pct']:+.1f}%</b> ({s['days_above_avg']}/{s['total_days']} ימים חזקים)\n"
-                        f"  ↳ שער: ${s['price']} ({s['day_change_pct']:+.2f}%)\n\n"
+                        f"• <b>{sym}</b>: שבועי <b>{s['period_surge_pct']:+d}%</b> | חודשי <b>{s['mom_change']:+.1f}%</b>\n"
+                        f"  ↳ {s['status_desc']}\n"
+                        f"  ↳ שער: ${s['price']} ({s['day_chg']:+.2f}%) | יחס יומי: {s['daily_rvol']:.2f}x\n\n"
                     )
                 await context.bot.send_message(chat_id=USER_CHAT_ID, text=stk_msg, parse_mode="HTML")
             else:
-                top_3 = sorted(stocks_data, key=lambda x: x[1]["daily_rvol"], reverse=True)[:3]
-                fallback = f"ℹ️ הווליום ב-<b>{sec_name}</b> מרוכז בעיקר בתעודת הסל. 3 המניות המובילות כעת:\n"
+                # אם הסקטור בתקופה עולה אך המניות ספציפית לא עברו את הרף
+                top_3 = sorted(regular_stocks_list, key=lambda x: x[1]["period_surge_pct"], reverse=True)[:3]
+                fallback = (
+                    f"ℹ️ בסקטור <b>{sec_name}</b> גל הווליום מתרכז בעיקר בתעודת הסל ({sec_etf}).\n"
+                    f"<b>מצב המניות עם יציבות הווליום היחסית הגבוהה ביותר:</b>\n"
+                )
                 for sym, s in top_3:
-                    fallback += f"• <b>{sym}</b>: RVol {s['daily_rvol']:.2f}x | MoM: {s['mom_vol_change_pct']:+.1f}%\n"
+                    fallback += f"• <b>{sym}</b>: תקופתי {s['period_surge_pct']:+d}% | חודשי {s['mom_change']:+.1f}% (שער ${s['price']})\n"
                 await context.bot.send_message(chat_id=USER_CHAT_ID, text=fallback, parse_mode="HTML")
+
+    if hot_sectors_found == 0:
+        await context.bot.send_message(
+            chat_id=USER_CHAT_ID,
+            text="😴 <b>אין כרגע תקופת ווליום עולה באף סקטור.</b>\nכל הסקטורים נמצאים ברמת פעילות שגרתית או נמוכה מהממוצע.",
+            parse_mode="HTML"
+        )
 
 def is_market_hours():
     now = datetime.datetime.now(ISRAEL_TZ)
@@ -250,12 +246,10 @@ def main():
     threading.Thread(target=run_web, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
-
     app.job_queue.run_repeating(scheduled_scanner_job, interval=900, first=20)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("monthly", monthly_trend_command))
 
     print("Volume Scanner Bot running...")
     app.run_polling()
