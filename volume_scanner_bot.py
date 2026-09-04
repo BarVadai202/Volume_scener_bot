@@ -4,11 +4,10 @@ import datetime
 import pytz
 from flask import Flask
 import yfinance as yf
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes
 )
 
@@ -23,8 +22,8 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
 
-# שים כאן את הטוקן של הבוט החדש שיצרת ב-BotFather
-TOKEN = os.environ.get("VOLUME_BOT_TOKEN", "8762564504:AAFY4xJVdXOxD08U6rZ9nQuqE2S0Rl3SQAQ")
+# הטוקן הקבוע של בוט סורק הווליום
+TOKEN = "8762564504:AAFY4xJVdXOxD08U6rZ9nQuqE2S0Rl3SQAQ"
 USER_CHAT_ID = None
 ISRAEL_TZ = pytz.timezone('Asia/Jerusalem')
 
@@ -58,8 +57,6 @@ SECTOR_STOCKS = {
     "VNQ": ["PLD", "AMT", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI"]
 }
 
-# מעקב יומי למניעת שליחת אותה התראה שוב ושוב באותו יום
-# מבנה: { "XLK": 1.35, "NVDA": 1.52 }
 notified_today = {}
 last_reset_date = None
 
@@ -72,28 +69,23 @@ def reset_daily_cache_if_needed():
 
 def calculate_relative_volume(ticker_symbol: str):
     """
-    מחשב את היחס בין המחזור הנוכחי היום לבין ממוצע המחזורים ב-20 ימי המסחר האחרונים.
-    מחזיר: (rvol, current_vol, avg_vol, price, change_pct)
+    מחשב את היחס בין המחזור הנוכחי היום לבין ממוצע המחזורים ב-20 הימים האחרונים
     """
     try:
         t = yf.Ticker(ticker_symbol)
-        # משיכת 30 ימי היסטוריה יומיים
         hist = t.history(period="1mo")
-        if hist.empty or len(hist) < 5:
+        if hist.empty or len(hist) < 3:
             return None
 
-        # מחזור של היום (הנר האחרון שמתעדכן בחי)
         curr_vol = float(hist['Volume'].iloc[-1])
         curr_close = float(hist['Close'].iloc[-1])
 
-        # חישוב שינוי יומי
         if len(hist) >= 2:
             prev_close = float(hist['Close'].iloc[-2])
             change_pct = ((curr_close - prev_close) / prev_close) * 100
         else:
             change_pct = 0.0
 
-        # ממוצע מחזור ב-20 הימים שקדמו להיום
         past_volumes = hist['Volume'].iloc[:-1].tail(20)
         if past_volumes.empty:
             return None
@@ -115,7 +107,6 @@ def calculate_relative_volume(ticker_symbol: str):
         return None
 
 def format_vol(v: float):
-    """עיצוב מספרים במיליונים או באלפים לתצוגה נקייה"""
     if v >= 1e6:
         return f"{v/1e6:.1f}M"
     elif v >= 1e3:
@@ -126,43 +117,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global USER_CHAT_ID
     USER_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
-        " radar <b>ברוך הבא לבוט סורק הווליום והסקטורים!</b>\n\n"
-        "הבוט סורק כל 15 דקות בשעות המסחר (16:30 עד 23:00):\n"
-        "• <b>רמה 1 (+15%):</b> מעקב והיערכות בסקטור\n"
-        "• <b>רמה 2 (+30%):</b> 🔔 התראה ראשונית על כניסת כסף\n"
+        "📡 <b>סורק הווליום והסקטורים מוכן לפעולה!</b>\n\n"
+        "הבוט סורק באופן אוטומטי כל 15 דקות בשעות המסחר (16:30 עד 23:00 שעון ישראל):\n"
+        "• <b>רמה 1 (+15%):</b> זיהוי סקטור חם וצלילה מיידית לסריקת המניות שלו\n"
+        "• <b>רמה 2 (+30%):</b> 🔔 התראה על כניסת מחזורים מוגברת\n"
         "• <b>רמה 3 (+50%):</b> 🚨 התראה חריגה על ווליום מוסדי כבד\n\n"
-        "פקודות זמינות:\n"
-        "/scan - הרצת סריקה מיידית ידנית עכשיו\n"
-        "/status - בדיקת מצב סורק הווליום",
+        "פקודות:\n"
+        "/scan - הרצת סריקת שוק מקיפה ומיידית כעת\n"
+        "/status - בדיקת מצב הסורק",
+        parse_mode="HTML"
+    )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.datetime.now(ISRAEL_TZ)
+    await update.message.reply_text(
+        f"📊 <b>סטטוס סורק שוק:</b>\n"
+        f"• שעה בישראל: <code>{now.strftime('%H:%M:%S')}</code>\n"
+        f"• תדירות סריקה: כל 15 דקות\n"
+        f"• התראות שנשלחו בסבב היומי: <b>{len(notified_today)}</b>",
         parse_mode="HTML"
     )
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global USER_CHAT_ID
     USER_CHAT_ID = update.message.chat_id
-    await update.message.reply_text("🔍 <b>מבצע סריקת שוק מלאה לסקטורים ומניות...</b>", parse_mode="HTML")
-    await run_market_scan(context)
-    await update.message.reply_text("✅ <b>הסריקה הסתיימה בהצלחה.</b>", parse_mode="HTML")
+    await update.message.reply_text("🔍 <b>מתחיל סריקה של כל 11 הסקטורים ומניותיהם...</b>", parse_mode="HTML")
+    await run_market_scan(context, is_manual=True)
+    await update.message.reply_text("🏁 <b>סריקת השוק הושלמה.</b>", parse_mode="HTML")
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.datetime.now(ISRAEL_TZ)
-    await update.message.reply_text(
-        f"📊 <b>סטטוס סורק שוק:</b>\n"
-        f"• שעה נוכחית בישראל: <code>{now.strftime('%H:%M:%S')}</code>\n"
-        f"• תדירות סריקה: כל 15 דקות\n"
-        f"• התראות שנשלחו היום: <b>{len(notified_today)}</b> נכסים",
-        parse_mode="HTML"
-    )
-
-async def run_market_scan(context: ContextTypes.DEFAULT_TYPE):
-    """פונקציית הסריקה הראשית שרצה כל 15 דקות"""
+async def run_market_scan(context: ContextTypes.DEFAULT_TYPE, is_manual: bool = False):
+    """סורק סקטורים, וברגע שמזהה ווליום חם בסקטור – צולל ישירות למניות שלו ומדווח עליהן"""
     if not USER_CHAT_ID:
         return
 
     reset_daily_cache_if_needed()
-    active_hot_sectors = []
+    hot_sectors_found = 0
 
-    # --- שלב 1: סריקת 11 הסקטורים ---
     for sec_etf, sec_name in SECTORS_MAP.items():
         data = calculate_relative_volume(sec_etf)
         if not data:
@@ -170,88 +160,92 @@ async def run_market_scan(context: ContextTypes.DEFAULT_TYPE):
 
         rvol = data["rvol"]
 
-        # רמה 1: ווליום גבוה מ-15% (RVol >= 1.15) - נכנס לפוקוס
+        # סקטור נחשב פעיל אם הווליום שלו מעל 15%+ מהממוצע (RVol >= 1.15)
         if rvol >= 1.15:
-            active_hot_sectors.append((sec_etf, sec_name, data))
+            hot_sectors_found += 1
+            sec_pct_above = int((rvol - 1) * 100)
 
-            # האם הגענו לרמת התראה ראשונית (30%+) או רצינית (50%+)?
-            prev_level = notified_today.get(sec_etf, 0)
+            if rvol >= 1.50:
+                sec_header = f"🚨🚨 <b>סקטור חריג מאוד (+50% ומעלה): {sec_name} ({sec_etf})</b>"
+            elif rvol >= 1.30:
+                sec_header = f"🔔 <b>סקטור בווליום גבוה (+30% ומעלה): {sec_name} ({sec_etf})</b>"
+            else:
+                sec_header = f"👀 <b>סקטור בהתעוררות (+15% ומעלה): {sec_name} ({sec_etf})</b>"
 
-            if rvol >= 1.50 and prev_level < 1.50:
-                notified_today[sec_etf] = 1.50
-                msg = (
-                    f"🚨🚨 <b><u>התראת ווליום חריגה בסקטור: {sec_name} ({sec_etf})</u></b>\n\n"
-                    f"📊 <b>מחזור נוכחי:</b> גבוה ב-<b>{int((rvol - 1)*100)}%+</b> מהממוצע!\n"
-                    f"• יחס ווליום (RVol): <b>{rvol:.2f}x</b>\n"
-                    f"• מחזור שנכנס: {format_vol(data['curr_vol'])} (ממוצע: {format_vol(data['avg_vol'])})\n"
-                    f"• מחיר סקטור: ${data['price']} ({data['change_pct']:+.2f}%)\n\n"
-                    "⚡ <i>הבוט מתחיל כעת סריקת עומק של כל מניות הסקטור...</i>"
+            sec_msg = (
+                f"{sec_header}\n"
+                f"• יחס ווליום (RVol): <b>{rvol:.2f}x</b> ({sec_pct_above:+d}% מהממוצע)\n"
+                f"• מחזור שנכנס: {format_vol(data['curr_vol'])} (ממוצע יומי: {format_vol(data['avg_vol'])})\n"
+                f"• שינוי שער: ${data['price']} ({data['change_pct']:+.2f}%)\n\n"
+                f"⚡ <i>סורק כעת את המניות המובילות ב-{sec_name}...</i>"
+            )
+            await context.bot.send_message(chat_id=USER_CHAT_ID, text=sec_msg, parse_mode="HTML")
+
+            # --- צלילה מיידית לסריקת כל מניות הסקטור ---
+            stocks = SECTOR_STOCKS.get(sec_etf, [])
+            stocks_results = []
+
+            for sym in stocks:
+                stk = calculate_relative_volume(sym)
+                if stk:
+                    stocks_results.append((sym, stk))
+
+            # מיון המניות לפי יחס הווליום מהגבוה ביותר לנמוך
+            stocks_results.sort(key=lambda x: x[1]["rvol"], reverse=True)
+
+            # סינון מניות שעברו את רף ה-15%+ (RVol >= 1.15)
+            hot_stocks = [item for item in stocks_results if item[1]["rvol"] >= 1.15]
+
+            if hot_stocks:
+                stk_msg = f"🎯 <b><u>מניות עם כניסת ווליום בסקטור {sec_name} ({sec_etf}):</u></b>\n\n"
+                for sym, s_data in hot_stocks:
+                    s_rvol = s_data["rvol"]
+                    pct_above = int((s_rvol - 1) * 100)
+
+                    if s_rvol >= 1.50:
+                        badge = "🚨 <b>מוסדי כבד (+50%)</b>"
+                    elif s_rvol >= 1.30:
+                        badge = "🔔 <b>ווליום גבוה (+30%)</b>"
+                    else:
+                        badge = "👀 <b>התעוררות (+15%)</b>"
+
+                    stk_msg += (
+                        f"• <b>{sym}</b>: {badge}\n"
+                        f"  ↳ יחס מחזור: <b>{s_rvol:.2f}x</b> ({pct_above:+d}%)\n"
+                        f"  ↳ מחזור: {format_vol(s_data['curr_vol'])} | שער: ${s_data['price']} ({s_data['change_pct']:+.2f}%)\n\n"
+                    )
+                await context.bot.send_message(chat_id=USER_CHAT_ID, text=stk_msg, parse_mode="HTML")
+            else:
+                # אם אף מניה בודדת לא עברה 15%, מציגים את 3 המובילות
+                top_3 = stocks_results[:3]
+                fallback_msg = (
+                    f"ℹ️ בסקטור <b>{sec_name}</b> הווליום מרוכז בעיקרו במדד.\n"
+                    f"<b>3 המניות המובילות בווליום יחסי כרגע:</b>\n"
                 )
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=msg, parse_mode="HTML")
+                for sym, s_data in top_3:
+                    fallback_msg += f"• <b>{sym}</b>: RVol {s_data['rvol']:.2f}x | שער ${s_data['price']} ({s_data['change_pct']:+.2f}%)\n"
+                await context.bot.send_message(chat_id=USER_CHAT_ID, text=fallback_msg, parse_mode="HTML")
 
-            elif rvol >= 1.30 and prev_level < 1.30:
-                notified_today[sec_etf] = 1.30
-                msg = (
-                    f"🔔 <b><u>התראת ווליום ראשונית בסקטור: {sec_name} ({sec_etf})</u></b>\n\n"
-                    f"📊 <b>מחזור נוכחי:</b> גבוה ב-<b>{int((rvol - 1)*100)}%+</b> מהממוצע.\n"
-                    f"• יחס ווליום (RVol): <b>{rvol:.2f}x</b>\n"
-                    f"• מחיר סקטור: ${data['price']} ({data['change_pct']:+.2f}%)\n"
-                    "👀 <i>מופעל מעקב על מניות הסקטור.</i>"
-                )
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=msg, parse_mode="HTML")
-
-    # --- שלב 2: סריקת מניות בסקטורים שנדלקו (+15% ומעלה) ---
-    for sec_etf, sec_name, sec_data in active_hot_sectors:
-        stocks = SECTOR_STOCKS.get(sec_etf, [])
-        for sym in stocks:
-            stk_data = calculate_relative_volume(sym)
-            if not stk_data:
-                continue
-
-            stk_rvol = stk_data["rvol"]
-            prev_stk_level = notified_today.get(sym, 0)
-
-            # בדיקת רמה 3 למניה (מעל 50% מהממוצע)
-            if stk_rvol >= 1.50 and prev_stk_level < 1.50:
-                notified_today[sym] = 1.50
-                msg = (
-                    f"🚨🚨 <b><u>ווליום מוסדי כבד במניה: {sym}</u></b>\n\n"
-                    f"📂 סקטור: <b>{sec_name} ({sec_etf})</b>\n"
-                    f"🔥 <b>חריגת מחזור:</b> <b>{int((stk_rvol - 1)*100)}%+</b> מעל הממוצע!\n"
-                    f"• יחס מחזור (RVol): <b>{stk_rvol:.2f}x</b>\n"
-                    f"• ווליום נוכחי: <b>{format_vol(stk_data['curr_vol'])}</b> (ממוצע יומי: {format_vol(stk_data['avg_vol'])})\n"
-                    f"• שער שוק: <b>${stk_data['price']}</b> ({stk_data['change_pct']:+.2f}%)"
-                )
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=msg, parse_mode="HTML")
-
-            # בדיקת רמה 2 למניה (מעל 30% מהממוצע)
-            elif stk_rvol >= 1.30 and prev_stk_level < 1.30:
-                notified_today[sym] = 1.30
-                msg = (
-                    f"🔔 <b><u>התראת ווליום עולה במניה: {sym}</u></b>\n\n"
-                    f"📂 סקטור: <b>{sec_name} ({sec_etf})</b>\n"
-                    f"📈 <b>חריגת מחזור:</b> <b>{int((stk_rvol - 1)*100)}%+</b> מעל הממוצע.\n"
-                    f"• יחס מחזור (RVol): <b>{stk_rvol:.2f}x</b>\n"
-                    f"• שער שוק: <b>${stk_data['price']}</b> ({stk_data['change_pct']:+.2f}%)"
-                )
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=msg, parse_mode="HTML")
+    if hot_sectors_found == 0 and is_manual:
+        await context.bot.send_message(
+            chat_id=USER_CHAT_ID,
+            text="😴 <b>אין כרגע חריגות ווליום בסקטורים</b> (אף סקטור לא עבר 15%+ מעל הממוצע). השוק רגוע יחסית.",
+            parse_mode="HTML"
+        )
 
 def is_market_hours():
-    """בודק האם השוק האמריקאי פתוח כעת (שני עד שישי, 16:30 עד 23:00 שעון ישראל)"""
     now = datetime.datetime.now(ISRAEL_TZ)
-    if now.weekday() >= 5:  # שבת או ראשון - אין מסחר
+    if now.weekday() >= 5:  # שבת או ראשון
         return False
     market_open = now.replace(hour=16, minute=25, second=0, microsecond=0)
     market_close = now.replace(hour=23, minute=5, second=0, microsecond=0)
     return market_open <= now <= market_close
 
 async def scheduled_scanner_job(context: ContextTypes.DEFAULT_TYPE):
-    """רץ כל 15 דקות, מבצע סריקה רק אם שעות המסחר פועלות"""
     if is_market_hours():
-        await run_market_scan(context)
+        await run_market_scan(context, is_manual=False)
 
 def main():
-    # הפעלת שרת ה-Web ברקע
     threading.Thread(target=run_web, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
