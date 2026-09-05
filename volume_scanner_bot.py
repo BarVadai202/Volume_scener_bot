@@ -4,10 +4,11 @@ import datetime
 import pytz
 from flask import Flask
 import yfinance as yf
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes
 )
 
@@ -15,7 +16,7 @@ web_app = Flask(__name__)
 
 @web_app.route('/')
 def health_check():
-    return "Volume Scanner Bot is active and running!"
+    return "Market Scanner Bot is active and running!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -27,17 +28,10 @@ USER_CHAT_ID = None
 ISRAEL_TZ = pytz.timezone('Asia/Jerusalem')
 
 SECTORS_MAP = {
-    "XLK": "טכנולוגיה",
-    "XLF": "פיננסים",
-    "XLE": "אנרגיה",
-    "XLV": "בריאות",
-    "XLY": "צרכנות מחזורית",
-    "XLI": "תעשייה",
-    "XLC": "תקשורת",
-    "XLU": "תשתיות",
-    "XLB": "חומרים",
-    "XLP": "צרכנות בסיסית",
-    "VNQ": "נדל\"ן"
+    "XLK": "טכנולוגיה", "XLF": "פיננסים", "XLE": "אנרגיה",
+    "XLV": "בריאות", "XLY": "צרכנות מחזורית", "XLI": "תעשייה",
+    "XLC": "תקשורת", "XLU": "תשתיות", "XLB": "חומרים",
+    "XLP": "צרכנות בסיסית", "VNQ": "נדל\"ן"
 }
 
 SECTOR_STOCKS = {
@@ -54,73 +48,61 @@ SECTOR_STOCKS = {
     "VNQ": ["PLD", "AMT", "EQIX", "SPG", "O", "WELL", "PSA", "DLR", "CCI"]
 }
 
+# סל מניות רחב לסריקת גאפים ומומנטום
+SCAN_UNIVERSE = sorted(list(set([stock for sublist in SECTOR_STOCKS.values() for stock in sublist] + [
+    "PLTR", "COIN", "SMCI", "ARM", "PANW", "CRWD", "MARA", "RIOT", "BABA", "BIDU", 
+    "UBER", "ABNB", "SNOW", "SHOP", "NET", "MDB", "DDOG", "ROKU", "AFRM", "HOOD"
+])))
+
 def format_vol(v: float):
     if v >= 1e9:
-        return f"{v/1e9:.1f}B"
+        return f"{v/1e9:.2f}B"
     elif v >= 1e6:
-        return f"{v/1e6:.1f}M"
+        return f"{v/1e6:.2f}M"
     elif v >= 1e3:
         return f"{v/1e3:.0f}K"
     return str(int(v))
 
+def build_menu():
+    keyboard = [
+        [InlineKeyboardButton("🔍 1. סריקת שוק וסקטורים מלאה", callback_data="btn_scan_market")],
+        [InlineKeyboardButton("⚡ 2. סורק גאפים בפתיחה (Gap > 7% | Vol > 1M | > $10)", callback_data="btn_scan_gaps")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- לוגיקת אופציה 1: סריקת שוק וסקטורים ---
+
 def detect_sustained_volume_period(ticker_symbol: str):
-    """
-    מנתח האם הנכס נמצא ב*תקופה* של ווליום חריג ועולה, ולא רק ביום בודד.
-    בודק:
-    1. יחס שבועי (5 ימי מסחר אחרונים) מול ממוצע חודשי/רב-חודשי (30 יום).
-    2. שינוי מצטבר מחודש לחודש (MoM Volume).
-    3. יחס יומי נוכחי.
-    """
     try:
         t = yf.Ticker(ticker_symbol)
         hist = t.history(period="3mo")
         if hist.empty or len(hist) < 35:
             return None
 
-        # נתונים נוכחיים
         curr_close = float(hist['Close'].iloc[-1])
         prev_close = float(hist['Close'].iloc[-2])
         day_chg = ((curr_close - prev_close) / prev_close) * 100
         curr_vol = float(hist['Volume'].iloc[-1])
 
-        # 1. ניתוח תקופתי: 5 ימים אחרונים מול 30 ימי מסחר קודמים
         last_5_days_vol = hist['Volume'].iloc[-5:]
         avg_5d = float(last_5_days_vol.mean())
 
         baseline_30d = hist['Volume'].iloc[-35:-5]
         avg_baseline = float(baseline_30d.mean()) if not baseline_30d.empty else 1.0
 
-        # יחס תקופתי (פי כמה השבוע האחרון גבוה מהחודש שקדם לו)
         period_ratio = avg_5d / avg_baseline if avg_baseline > 0 else 1.0
         period_surge_pct = int((period_ratio - 1.0) * 100)
 
-        # 2. ניתוח חודש מול חודש קודם (MoM)
         last_month = hist.iloc[-21:]
         prev_month = hist.iloc[-42:-21]
         vol_last_m = float(last_month['Volume'].sum())
         vol_prev_m = float(prev_month['Volume'].sum())
         mom_change = ((vol_last_m - vol_prev_m) / vol_prev_m) * 100 if vol_prev_m > 0 else 0.0
 
-        # 3. יחס יומי בודד
         avg_20d = float(hist['Volume'].iloc[-21:-1].mean())
         daily_rvol = curr_vol / avg_20d if avg_20d > 0 else 1.0
 
-        # ניסוח הסבר מילולי חכם על התקופה
-        if period_surge_pct >= 50 or mom_change >= 50:
-            status_desc = "🚨 <b>גל ווליום מוסדי כבד:</b> כל התקופה האחרונה חווה זרימת כספים אגרסיבית מעל 50% מהרגיל."
-            is_hot_period = True
-        elif period_surge_pct >= 30 or mom_change >= 30:
-            status_desc = "🌊 <b>תקופת איסוף עקבית:</b> הממוצע של ימי המסחר האחרונים גבוה ב-30%+ מחודש הבסיס."
-            is_hot_period = True
-        elif period_surge_pct >= 15 or mom_change >= 15:
-            status_desc = "📈 <b>מגמת התעוררות תקופתית:</b> עלייה מצטברת של 15%+ ברמת הווליום הממוצעת."
-            is_hot_period = True
-        elif daily_rvol >= 1.30 and mom_change < 0:
-            status_desc = "⚠️ <b>נר בודד בלבד (אין גל תקופתי):</b> יש קפיצה יומית נקודתית, אך ברמה החודשית הווליום בירידה."
-            is_hot_period = False
-        else:
-            status_desc = "💤 <b>תקופה רגילה/נמוכה:</b> אין חריגה תקופתית משמעותית."
-            is_hot_period = False
+        is_hot_period = (period_surge_pct >= 15 or mom_change >= 15 or daily_rvol >= 1.30)
 
         return {
             "price": round(curr_close, 2),
@@ -130,128 +112,198 @@ def detect_sustained_volume_period(ticker_symbol: str):
             "period_surge_pct": period_surge_pct,
             "mom_change": round(mom_change, 1),
             "daily_rvol": round(daily_rvol, 2),
-            "status_desc": status_desc,
-            "is_hot_period": is_hot_period,
-            "avg_5d": avg_5d,
-            "avg_baseline": avg_baseline
+            "is_hot_period": is_hot_period
         }
     except Exception as e:
-        print(f"Error checking period for {ticker_symbol}: {e}")
+        print(f"Error checking {ticker_symbol}: {e}")
         return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global USER_CHAT_ID
-    USER_CHAT_ID = update.message.chat_id
-    await update.message.reply_text(
-        "📡 <b>סורק תקופות ווליום ומגמות שוק מחובר!</b>\n\n"
-        "הבוט מתמקד ב<b>תקופות של ווליום עולה</b> (השוואת שבועות וחודשים) ולא בנר בודד ומטעה.\n\n"
-        "פקודות:\n"
-        "/scan - סריקת תקופות ווליום בכל הסקטורים והמניות עכשיו\n"
-        "/status - בדיקת מצב מערכת",
-        parse_mode="HTML"
-    )
-
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global USER_CHAT_ID
-    USER_CHAT_ID = update.message.chat_id
-    await update.message.reply_text("🔍 <b>בודק תקופות של ווליום עולה בסקטורים ובמניות...</b>", parse_mode="HTML")
-    await run_market_scan(context)
-    await update.message.reply_text("🏁 <b>הסריקה הושלמה.</b>", parse_mode="HTML")
-
-async def run_market_scan(context: ContextTypes.DEFAULT_TYPE):
-    if not USER_CHAT_ID:
-        return
-
+async def execute_market_scan(bot, chat_id: int):
+    await bot.send_message(chat_id=chat_id, text="🔍 <b>מתחיל סריקת שוק וסקטורים...</b>", parse_mode="HTML")
     hot_sectors_found = 0
 
     for sec_etf, sec_name in SECTORS_MAP.items():
         sec_data = detect_sustained_volume_period(sec_etf)
-        if not sec_data:
+        if not sec_data or not sec_data["is_hot_period"]:
             continue
 
-        # מסננים: מתריעים רק אם יש תקופה של ווליום עולה (מעל 15%+ בתקופה)
-        if sec_data["is_hot_period"]:
-            hot_sectors_found += 1
+        hot_sectors_found += 1
+        sec_msg = (
+            f"🏢 <b><u>תקופת ווליום עולה: {sec_name} ({sec_etf})</u></b>\n\n"
+            f"• יחס שבועי מול חודש קודם: <b>{sec_data['period_ratio']:.2f}x</b> ({sec_data['period_surge_pct']:+d}%)\n"
+            f"• שינוי ווליום MoM: <b>{sec_data['mom_change']:+.1f}%</b>\n"
+            f"• יחס מחזור יומי: <b>{sec_data['daily_rvol']:.2f}x</b>\n"
+            f"• שער נוכחי: ${sec_data['price']} ({sec_data['day_chg']:+.2f}%)\n\n"
+            f"🔎 <i>סורק מניות מובילות בתוך הסקטור...</i>"
+        )
+        await bot.send_message(chat_id=chat_id, text=sec_msg, parse_mode="HTML")
 
-            sec_msg = (
-                f"🏢 <b><u>תקופת ווליום עולה בסקטור {sec_name} ({sec_etf})</u></b>\n\n"
-                f"{sec_data['status_desc']}\n\n"
-                f"📊 <b>נתוני התקופה:</b>\n"
-                f"• יחס שבועי מול חודש קודם: <b>{sec_data['period_ratio']:.2f}x</b> ({sec_data['period_surge_pct']:+d}%)\n"
-                f"• שינוי ווליום חודש מול חודש (MoM): <b>{sec_data['mom_change']:+.1f}%</b>\n"
-                f"• יחס בנר היומי הנוכחי: {sec_data['daily_rvol']:.2f}x\n"
-                f"• שער: ${sec_data['price']} ({sec_data['day_chg']:+.2f}%)\n\n"
-                f"🔎 <i>סורק מניות בתוך {sec_name} שנמצאות גם הן בגל ווליום תקופתי...</i>"
-            )
-            await context.bot.send_message(chat_id=USER_CHAT_ID, text=sec_msg, parse_mode="HTML")
+        stocks = SECTOR_STOCKS.get(sec_etf, [])
+        hot_stocks = []
+        for sym in stocks:
+            s_res = detect_sustained_volume_period(sym)
+            if s_res and s_res["is_hot_period"]:
+                hot_stocks.append((sym, s_res))
 
-            # סריקת מניות הסקטור
-            stocks = SECTOR_STOCKS.get(sec_etf, [])
-            hot_stocks_list = []
-            regular_stocks_list = []
-
-            for sym in stocks:
-                s_res = detect_sustained_volume_period(sym)
-                if not s_res:
-                    continue
-                # אם המניה בעצמה בתקופת ווליום עולה
-                if s_res["is_hot_period"]:
-                    hot_stocks_list.append((sym, s_res))
-                else:
-                    regular_stocks_list.append((sym, s_res))
-
-            if hot_stocks_list:
-                # מיון מהתקופה החמה ביותר
-                hot_stocks_list.sort(key=lambda x: x[1]["period_surge_pct"], reverse=True)
-                stk_msg = f"🔥 <b><u>מניות שנמצאות בתקופת ווליום עולה ב-{sec_name}:</u></b>\n\n"
-
-                for sym, s in hot_stocks_list:
-                    stk_msg += (
-                        f"• <b>{sym}</b>: שבועי <b>{s['period_surge_pct']:+d}%</b> | חודשי <b>{s['mom_change']:+.1f}%</b>\n"
-                        f"  ↳ {s['status_desc']}\n"
-                        f"  ↳ שער: ${s['price']} ({s['day_chg']:+.2f}%) | יחס יומי: {s['daily_rvol']:.2f}x\n\n"
-                    )
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=stk_msg, parse_mode="HTML")
-            else:
-                # אם הסקטור בתקופה עולה אך המניות ספציפית לא עברו את הרף
-                top_3 = sorted(regular_stocks_list, key=lambda x: x[1]["period_surge_pct"], reverse=True)[:3]
-                fallback = (
-                    f"ℹ️ בסקטור <b>{sec_name}</b> גל הווליום מתרכז בעיקר בתעודת הסל ({sec_etf}).\n"
-                    f"<b>מצב המניות עם יציבות הווליום היחסית הגבוהה ביותר:</b>\n"
+        if hot_stocks:
+            hot_stocks.sort(key=lambda x: x[1]["daily_rvol"], reverse=True)
+            stk_msg = f"🔥 <b>מניות עם ווליום עולה ב-{sec_name}:</b>\n\n"
+            for sym, s in hot_stocks:
+                stk_msg += (
+                    f"• <b>{sym}</b>: יומי <b>{s['daily_rvol']:.2f}x</b> | שבועי <b>{s['period_surge_pct']:+d}%</b>\n"
+                    f"  ↳ מחזור: {format_vol(s['curr_vol'])} | שער: ${s['price']} ({s['day_chg']:+.2f}%)\n\n"
                 )
-                for sym, s in top_3:
-                    fallback += f"• <b>{sym}</b>: תקופתי {s['period_surge_pct']:+d}% | חודשי {s['mom_change']:+.1f}% (שער ${s['price']})\n"
-                await context.bot.send_message(chat_id=USER_CHAT_ID, text=fallback, parse_mode="HTML")
+            await bot.send_message(chat_id=chat_id, text=stk_msg, parse_mode="HTML")
 
     if hot_sectors_found == 0:
-        await context.bot.send_message(
-            chat_id=USER_CHAT_ID,
-            text="😴 <b>אין כרגע תקופת ווליום עולה באף סקטור.</b>\nכל הסקטורים נמצאים ברמת פעילות שגרתית או נמוכה מהממוצע.",
+        await bot.send_message(chat_id=chat_id, text="😴 <b>אין כרגע חריגות ווליום בסקטורים.</b> הפעילות שגרתית.", parse_mode="HTML")
+
+    await bot.send_message(chat_id=chat_id, text="🏁 <b>סריקת השוק הסתיימה.</b>", reply_markup=build_menu(), parse_mode="HTML")
+
+# --- לוגיקת אופציה 2: סורק גאפים בפתיחה ---
+
+def check_gap_and_volume(ticker_symbol: str):
+    """
+    בודק:
+    1. ווליום נוכחי > 1,000,000 מניות
+    2. מחיר נוכחי > $10
+    3. פתיחה בגאפ של מעל 7%+ או ירידה מעל 7%- ביחס לסגירה הקודמת
+    """
+    try:
+        t = yf.Ticker(ticker_symbol)
+        hist = t.history(period="2d")
+        if len(hist) < 2:
+            return None
+
+        prev_close = float(hist['Close'].iloc[-2])
+        curr_open = float(hist['Open'].iloc[-1])
+        curr_price = float(hist['Close'].iloc[-1])
+        curr_volume = float(hist['Volume'].iloc[-1])
+
+        # תנאי 1: מחיר מעל $10
+        if curr_price < 10.0:
+            return None
+
+        # תנאי 2: ווליום מעל 1M מניות
+        if curr_volume < 1_000_000:
+            return None
+
+        # תנאי 3: גאפ פתיחה מעל 7% (למעלה או למטה)
+        gap_pct = ((curr_open - prev_close) / prev_close) * 100
+        current_chg_pct = ((curr_price - prev_close) / prev_close) * 100
+
+        if abs(gap_pct) >= 7.0 or abs(current_chg_pct) >= 7.0:
+            return {
+                "symbol": ticker_symbol,
+                "price": round(curr_price, 2),
+                "open": round(curr_open, 2),
+                "prev_close": round(prev_close, 2),
+                "gap_pct": round(gap_pct, 2),
+                "current_chg_pct": round(current_chg_pct, 2),
+                "volume": curr_volume
+            }
+    except Exception:
+        pass
+    return None
+
+async def execute_gap_scan(bot, chat_id: int):
+    await bot.send_message(
+        chat_id=chat_id,
+        text="⚡ <b>מבצע סריקת גאפים ומומנטום...</b>\nתנאים: ווליום > 1M | מחיר > $10 | גאפ > 7%",
+        parse_mode="HTML"
+    )
+
+    matches = []
+    for sym in SCAN_UNIVERSE:
+        res = check_gap_and_volume(sym)
+        if res:
+            matches.append(res)
+
+    if matches:
+        matches.sort(key=lambda x: abs(x["gap_pct"]), reverse=True)
+        msg = f"🎯 <b><u>נמצאו {len(matches)} מניות העונות להגדרות הגאפ והווליום:</u></b>\n\n"
+        for m in matches:
+            direction_icon = "🟢 זינוק (Gap Up)" if m["gap_pct"] > 0 else "🔴 נפילה (Gap Down)"
+            msg += (
+                f"• <b>{m['symbol']}</b> | {direction_icon}\n"
+                f"  ↳ גאפ פתיחה: <b>{m['gap_pct']:+.2f}%</b> (פתיחה: ${m['open']} | סגירה קודמת: ${m['prev_close']})\n"
+                f"  ↳ שער נוכחי: <b>${m['price']}</b> ({m['current_chg_pct']:+.2f}%)\n"
+                f"  ↳ מחזור מסחר: <b>{format_vol(m['volume'])}</b> מניות\n\n"
+            )
+        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="ℹ️ לא נמצאו כרגע מניות העונות במדויק לשלושת התנאים (מחיר מעל $10, ווליום מעל 1M וגאפ מעל 7%).",
             parse_mode="HTML"
         )
 
-def is_market_hours():
-    now = datetime.datetime.now(ISRAEL_TZ)
-    if now.weekday() >= 5:
-        return False
-    market_open = now.replace(hour=16, minute=25, second=0, microsecond=0)
-    market_close = now.replace(hour=23, minute=5, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    await bot.send_message(chat_id=chat_id, text="בחר פעולה:", reply_markup=build_menu(), parse_mode="HTML")
 
-async def scheduled_scanner_job(context: ContextTypes.DEFAULT_TYPE):
-    if is_market_hours():
-        await run_market_scan(context)
+# --- תפריט ואירועים ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global USER_CHAT_ID
+    USER_CHAT_ID = update.message.chat_id
+    text = (
+        "👋 <b>ברוך הבא למערכת הסריקה המתקדמת!</b>\n\n"
+        "בחר אפשרות לביצוע מיידי בלחיצה:\n"
+        "1️⃣ <b>סריקת שוק וסקטורים:</b> בודק זרימת כספים וסקטורים חמים (מתוזמן אוטומטית ל-16:45 ו-22:30).\n"
+        "2️⃣ <b>סורק גאפים ומומנטום בפתיחה:</b> מאתר מניות עם ווליום מעל 1M, מחיר מעל $10 וגאפ מעל 7% (מתוזמן אוטומטית ל-16:40)."
+    )
+    await update.message.reply_text(text, reply_markup=build_menu(), parse_mode="HTML")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+
+    if data == "btn_scan_market":
+        await execute_market_scan(context.bot, chat_id)
+    elif data == "btn_scan_gaps":
+        await execute_gap_scan(context.bot, chat_id)
+
+# --- תזמונים אוטומטיים קבועים ---
+
+async def job_morning_gaps(context: ContextTypes.DEFAULT_TYPE):
+    """סריקת גאפים ומומנטום ב-16:40 (10 דקות אחרי הפתיחה)"""
+    if USER_CHAT_ID:
+        await context.bot.send_message(chat_id=USER_CHAT_ID, text="⏰ <b>התחלת יום המסחר: מפעיל סורק גאפים ומומנטום...</b>", parse_mode="HTML")
+        await execute_gap_scan(context.bot, USER_CHAT_ID)
+
+async def job_market_open_scan(context: ContextTypes.DEFAULT_TYPE):
+    """סריקת שוק וסקטורים ראשונה ב-16:45 (רבע שעה אחרי הפתיחה)"""
+    if USER_CHAT_ID:
+        await context.bot.send_message(chat_id=USER_CHAT_ID, text="⏰ <b>סריקת שוק וסקטורים יומית (תחילת המסחר):</b>", parse_mode="HTML")
+        await execute_market_scan(context.bot, USER_CHAT_ID)
+
+async def job_market_close_scan(context: ContextTypes.DEFAULT_TYPE):
+    """סריקת שוק וסקטורים שנייה ב-22:30 (חצי שעה לפני הנעילה)"""
+    if USER_CHAT_ID:
+        await context.bot.send_message(chat_id=USER_CHAT_ID, text="⏰ <b>סריקת שוק וסקטורים (חצי שעה לנעילת המסחר):</b>", parse_mode="HTML")
+        await execute_market_scan(context.bot, USER_CHAT_ID)
 
 def main():
     threading.Thread(target=run_web, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
-    app.job_queue.run_repeating(scheduled_scanner_job, interval=900, first=20)
+    job_queue = app.job_queue
+    trading_days = (0, 1, 2, 3, 4)  # שני עד שישי
+
+    # 1. סורק גאפים ומומנטום ב-16:40
+    job_queue.run_daily(job_morning_gaps, time=datetime.time(hour=16, minute=40, tzinfo=ISRAEL_TZ), days=trading_days)
+
+    # 2. סריקת שוק בתחילת המסחר ב-16:45
+    job_queue.run_daily(job_market_open_scan, time=datetime.time(hour=16, minute=45, tzinfo=ISRAEL_TZ), days=trading_days)
+
+    # 3. סריקת שוק חצי שעה לפני הנעילה ב-22:30
+    job_queue.run_daily(job_market_close_scan, time=datetime.time(hour=22, minute=30, tzinfo=ISRAEL_TZ), days=trading_days)
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-    print("Volume Scanner Bot running...")
+    print("Market & Gap Scanner Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
